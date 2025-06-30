@@ -1,0 +1,4 @@
+generated/
+.venv/
+.vscode/
+.python-version/

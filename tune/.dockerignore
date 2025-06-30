@@ -1,0 +1,7 @@
+**/.git
+.git
+*.log
+node_modules
+*.ipynb
+*.lock
+**/.venv/

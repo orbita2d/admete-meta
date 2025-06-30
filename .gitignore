@@ -1,0 +1,15 @@
+# .vscode directory
+.vscode
+
+*.gen
+*.exe
+*.dll
+*.dll.a
+Makefile
+
+CMakeFiles
+
+CMakeCache.txt
+Testing
+
+*.ipynb
