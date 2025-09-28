@@ -40,26 +40,35 @@ from flax.nnx import initializers
 logger = logging.getLogger(__name__)
 
 N_FEATURES = 64 * 5
-        
+LOGISTIC_SCALING = 400.
 
+
+ENABLE_NNUE = True
 class AdmeteModel(nnx.Module):
     def __init__(self, rngs):
         AccumulatorSize = 256
-        HiddenSize = 72
+        HiddenSize = 64
         self.accumulator_baseline = nnx.Linear(
-            2*(N_FEATURES+64),
+            2*N_FEATURES,
             AccumulatorSize,
             rngs=rngs,
             use_bias=False
         )
-        # self.accumulator_delta = nnx.LinearGeneral(
-        #     (N_FEATURES, 64, 2), # for each player for each feature, for each king location
-        #     AccumulatorSize,
-        #     rngs=rngs,
-        #     axis=(-1, -2, -3),
-        #     use_bias=False,
-        #     # kernel_init=initializers.zeros, # no initial delta, we learn it from scratch
-        # )
+        self.accumulator_kings = nnx.Linear(
+            128, # 64 for each king
+            AccumulatorSize,
+            rngs=rngs,
+            use_bias=False
+        )
+        if ENABLE_NNUE:
+            self.accumulator_delta = nnx.LinearGeneral(
+                (N_FEATURES, 64, 2), # for each player for each feature, for each king location
+                AccumulatorSize,
+                rngs=rngs,
+                axis=(-1, -2, -3),
+                use_bias=False,
+                # kernel_init=initializers.zeros, # no initial delta, we learn it from scratch
+            )
         self.accumulator_batchnorm = nnx.BatchNorm(AccumulatorSize, rngs=rngs, use_bias=True, use_scale=False) # apply the bias after the batchnorm
         self.hidden_layer = nnx.Linear(
             AccumulatorSize,
@@ -80,17 +89,20 @@ class AdmeteModel(nnx.Module):
         assert us.shape[1] == N_FEATURES
         assert us.shape == them.shape
 
-        x1 = self.accumulator_baseline(jnp.concatenate([us, jax.nn.one_hot(k_us, 64), them, jax.nn.one_hot(k_them, 64)], axis=-1))  
-        # def delta_part(us, them, k_us, k_them):
-        #     lk = self.accumulator_delta.kernel[:, k_us, 0].T @ us
-        #     rk = self.accumulator_delta.kernel[:, k_them, 1].T @ them
-        #     return lk + rk
-        # if not zero_delta:
-        #     x2 = nnx.vmap(delta_part, in_axes=(0, 0, 0, 0), out_axes=0)(us, them, k_us, k_them)
-        #     x = x1 + x2
-        # else:
-        #     x = x1
-        x = x1
+        x1 = self.accumulator_baseline(jnp.concatenate([us, them], axis=-1))  
+        x1 += self.accumulator_kings(jnp.concatenate([nnx.one_hot(k_us, 64), nnx.one_hot(k_them, 64)], axis=-1))
+        if ENABLE_NNUE:
+            def delta_part(us, them, k_us, k_them):
+                lk = self.accumulator_delta.kernel[:, k_us, 0].T @ us
+                rk = self.accumulator_delta.kernel[:, k_them, 1].T @ them
+                return lk + rk
+            if not zero_delta:
+                x2 = nnx.vmap(delta_part, in_axes=(0, 0, 0, 0), out_axes=0)(us, them, k_us, k_them)
+                x = x1 + x2
+            else:
+                x = x1
+        else:
+            x = x1
 
         x = self.accumulator_batchnorm(x, use_running_average=not train)
         x = nnx.relu(x)
@@ -370,7 +382,7 @@ def main() -> None:
     script_path = Path(__file__).resolve()
     shutil.copy2(script_path, dated_checkpoint_path / script_path.name)
     
-    logistic_scaling = 400.
+    logistic_scaling = LOGISTIC_SCALING
     logger.info(f"Logistic scaling: {logistic_scaling:.0f}cp")
     regularization = jnp.exp(args.regularization) # exponentiate so I don't have to write 0.000001 like a caveman
     logger.info(f"Regularization: {regularization:.5g}")
