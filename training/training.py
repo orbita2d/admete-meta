@@ -10,6 +10,7 @@
 #    "scipy",
 #    "pyarrow",
 #    "tqdm",
+#   "mlflow",
 #   ]
 # ///
 
@@ -17,6 +18,7 @@ import argparse
 from functools import partial
 import inspect
 import logging
+import os
 from pathlib import Path
 import shutil
 from typing import Literal
@@ -33,21 +35,22 @@ from jax import numpy as jnp
 import pyarrow as pa
 import pyarrow.dataset as pds
 from tqdm.auto import tqdm
-from jax import random
-from flax.nnx import initializers
-
+import mlflow
 
 logger = logging.getLogger(__name__)
 
 N_FEATURES = 64 * 5
 LOGISTIC_SCALING = 400.
-
-
 ENABLE_NNUE = True
+HYPERPARAM_ACCUMULATOR_SIZE = int(os.environ.get("HYPERPARAM_ACCUMULATOR_SIZE", 256))
+HYPERPARAM_HIDDEN_SIZE = int(os.environ.get("HYPERPARAM_HIDDEN_SIZE", 64))
+HYPERPARAM_LEARNING_RATE_PEAK = float(os.environ.get("HYPERPARAM_LEARNING_RATE_PEAK", 4e-3))
+HYPERPARAM_LEARNING_RATE_END = float(os.environ.get("HYPERPARAM_LEARNING_RATE_END", 2e-6))
+
 class AdmeteModel(nnx.Module):
     def __init__(self, rngs):
-        AccumulatorSize = 256
-        HiddenSize = 64
+        AccumulatorSize = HYPERPARAM_ACCUMULATOR_SIZE
+        HiddenSize = HYPERPARAM_HIDDEN_SIZE
         self.accumulator_baseline = nnx.Linear(
             2*N_FEATURES,
             AccumulatorSize,
@@ -144,9 +147,10 @@ delta_params = nnx.All(nnx.Param, nnx.PathContains("accumulator_delta"))
 def train_step(model:nnx.Module, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, batch: dict[str, jax.Array], regularization: float, freeze_delta: bool = False):
     def loss(model: AdmeteModel, regularization: float):
         pred = model(batch['f_us'], batch['f_them'], batch['k_us'], batch['k_them'], train=True, zero_delta=freeze_delta)
-        # loss = loss_fn(nnx.sigmoid(pred), batch['label']) + regularize(model, regularization, zero_delta=freeze_delta)
-        loss = loss_fn(nnx.sigmoid(pred), batch['label'])
-        return loss
+        if ENABLE_NNUE:
+            return loss_fn(nnx.sigmoid(pred), batch['label']) + regularize(model, regularization, zero_delta=freeze_delta)
+        else:
+            return loss_fn(nnx.sigmoid(pred), batch['label'])
     
     if freeze_delta:
         diff_state = nnx.DiffState(0, base_params) # only update the base parameters, not the delta parameters (much faster)
@@ -337,26 +341,23 @@ class FileSource:
             yield res
     
 def main() -> None:
-    arg_parser = argparse.ArgumentParser(description="Train a neural network to predict evals from feature vectors.")
-    arg_parser.add_argument("train", type=str, help="Path to the training data.")
-    arg_parser.add_argument("output", type=str, help="Path to the output file.")
-    arg_parser.add_argument("iterations", type=int, help="Number of iterations to train for.")
-    arg_parser.add_argument("--regularization", type=float, default=0.0, help="L2 regularization strength.")
-    args = arg_parser.parse_args()
-
-    train_file = Path(args.train)
+    train_file = Path(os.environ.get("TRAIN_FILE"))
     assert train_file.exists(), f"Train file {train_file} does not exist."
 
-    checkpoint_path = Path(args.output)
+    checkpoint_path = Path(os.environ.get("CHECKPOINT_PATH"))
     assert checkpoint_path.exists(), f"Checkpoint path {checkpoint_path} does not exist."
     dated_checkpoint_path = checkpoint_path / f"{pd.Timestamp.now().strftime('%Y-%m-%d_%H-%M-%S')}"
     dated_checkpoint_path.mkdir()
     assert dated_checkpoint_path.exists(), f"Failed to create checkpoint path {checkpoint_path}."
     checkpoint_path = dated_checkpoint_path.resolve()
 
-    iterations = args.iterations
+    iterations = os.environ.get("ITERATIONS", None)
+    assert iterations is not None, "ITERATIONS environment variable is not set."
+    iterations = int(iterations)
     assert isinstance(iterations, int), f"Iterations must be an integer, not {type(iterations)}."
     assert iterations > 0, f"Iterations must be positive, not {iterations}."
+
+    parent_run_id = os.environ.get("MLFLOW_PARENT_RUN_ID", None)
 
     logger.setLevel(logging.INFO)
     # logger.setLevel(logging.DEBUG)
@@ -384,8 +385,8 @@ def main() -> None:
     
     logistic_scaling = LOGISTIC_SCALING
     logger.info(f"Logistic scaling: {logistic_scaling:.0f}cp")
-    regularization = jnp.exp(args.regularization) # exponentiate so I don't have to write 0.000001 like a caveman
-    logger.info(f"Regularization: {regularization:.5g}")
+    regularization_log = float(os.environ.get("REGULARIZATION_LOG", "0")) # exponentiate so I don't have to write 0.000001 like a caveman
+    regularization = float(np.exp(regularization_log))
 
     seed = 314159
 
@@ -398,13 +399,12 @@ def main() -> None:
     steps_per_epoch = (len(data_loader)-1) // batch_size + 1
     validation_freq = 1<<11
 
-
     model = AdmeteModel(rngs=nnx.Rngs(seed))
     total_steps = iterations // gradient_accumulation_steps
     warmup_steps = total_steps // 10  # 10% warmup
     end_steps = total_steps // 10  # 10% end
-    peak_lr = 4e-3
-    end_lr = 2e-6
+    peak_lr = float(HYPERPARAM_LEARNING_RATE_PEAK)
+    end_lr = float(HYPERPARAM_LEARNING_RATE_END)
 
     schedule = optax.join_schedules([
         optax.linear_schedule(0, peak_lr, warmup_steps),
@@ -435,23 +435,6 @@ def main() -> None:
 
     checkpointer = ocp.StandardCheckpointer()
 
-    with open(checkpoint_path / "config.txt", "w") as f:
-        f.write(f"Train file: {train_file}\n")
-        f.write(f"Output path: {checkpoint_path}\n")
-        f.write(f"Iterations: {iterations}\n")
-        # f.write(f"Learning rate: {learning_rate}\n")
-        f.write(f"Gradient accumulation steps: {gradient_accumulation_steps}\n")
-        f.write(f"LR schedule: {schedule}\n")
-        f.write(f"Logistic scaling: {logistic_scaling:.0f}\n")
-        f.write(f"Regularization: {regularization:.5g}\n")
-        f.write(f"Validation frequency: {validation_freq}\n")
-        f.write(f"Checkpoint frequency: {checkpoint_freq}\n")
-        f.write(f"Batch size: {batch_size}\n")
-        f.write(f"Training samples: {data_loader.samples("train")}\n")
-        f.write(f"Training samples: {data_loader.samples("test")}\n")
-        f.write(f"Model:\n")
-        f.write(f"{inspect.getsource(AdmeteModel)}\n")
-
     with open(checkpoint_path / "metrics.csv", "w") as f:
         f.write("step,epoch")
         for metric in metrics_history.keys():
@@ -459,54 +442,95 @@ def main() -> None:
         f.write("\n")
 
     # Train
-    logger.info(f"Training for {iterations} iterations")
-    for step, batch in tqdm(enumerate(data_loader.batched(batch_size, dataset="train")), total=iterations):
-        logger.debug(f"Step {step:>{int(np.log10(iterations)+1)}}")
-        # freeze_delta = step < iterations // 5 # freeze the delta parameters for the 20%
-        # opt = optimizer_base if freeze_delta else optimizer
-        train_step(model, optimizer, train_metrics, batch, regularization, freeze_delta=False)
-        if ((step % validation_freq == 0) or (step == iterations-1)):
-            epoch = step / steps_per_epoch
-            for metric, value in train_metrics.compute().items():  # Compute the metrics.
-                metrics_history[f'train_{metric}'].append(float(value))  # Record the metrics.
-            train_metrics.reset()  # Reset the metrics for the test set.
-            # test batch
-            for test_batch in data_loader.batched(batch_size, dataset="test", repeat=False):
-                eval_step(model, test_metrics, test_batch)
-            for metric, value in test_metrics.compute().items():
-                metrics_history[f'test_{metric}'].append(float(value))
-            test_metrics.reset()
+    mlflow.set_experiment("admete-training")
 
-            logger.info(f"Epoch {epoch:>{int(np.log10((iterations-1)/steps_per_epoch+1)+6)}.5f} / step {step:>{int(np.log10(iterations)+1)}}: Train loss: {metrics_history['train_loss'][-1]:.5f}, Test loss: {metrics_history['test_loss'][-1]:.5f}")
-            # save metrics
-            with open(checkpoint_path / "metrics.csv", "a") as f:
-                f.write(f"{step},{epoch:.5f}")
+    with mlflow.start_run(parent_run_id=parent_run_id) as run:
+        mlflow.log_param("train_file", str(train_file))
+        mlflow.log_param("batch_size", batch_size)
+        # real hyperparameters
+        mlflow.log_param("iterations", iterations)
+        mlflow.log_param("logistic_scaling", logistic_scaling)
+        mlflow.log_param("regularization", regularization)
+        mlflow.log_param("regularization_log", regularization_log)
+        mlflow.log_param("size_accumulator", HYPERPARAM_ACCUMULATOR_SIZE)
+        mlflow.log_param("size_hidden", HYPERPARAM_HIDDEN_SIZE)
+        mlflow.log_param("checkpoint_freq", checkpoint_freq)
+        mlflow.log_param("validation_freq", validation_freq)
+        mlflow.log_param("training_samples", data_loader.samples("train"))
+        mlflow.log_param("test_samples", data_loader.samples("test"))
+        mlflow.set_tag("device", jax.devices()[0].device_kind)
+        mlflow.set_tag("enable_nnue", ENABLE_NNUE)
+        # schedule parameters
+        mlflow.log_param("peak_lr", peak_lr)
+        mlflow.log_param("end_lr", end_lr)
+        mlflow.log_param("gradient_accumulation_steps", gradient_accumulation_steps)
+        mlflow.log_param("warmup_steps", warmup_steps)
+
+        # upload this script to mlflow
+        mlflow.log_artifact(script_path, artifact_path="code")
+        logger.info(f"Training for {iterations} iterations")
+        for step, batch in enumerate(data_loader.batched(batch_size, dataset="train")):
+            logger.debug(f"Step {step:>{int(np.log10(iterations)+1)}}")
+            # freeze_delta = step < iterations // 5 # freeze the delta parameters for the 20%
+            # opt = optimizer_base if freeze_delta else optimizer
+            train_step(model, optimizer, train_metrics, batch, regularization, freeze_delta=False)
+            if ((step % validation_freq == 0) or (step == iterations-1)):
+                epoch = step / steps_per_epoch
+                for metric, value in train_metrics.compute().items():  # Compute the metrics.
+                    metrics_history[f'train_{metric}'].append(float(value))  # Record the metrics.
+                train_metrics.reset()  # Reset the metrics for the test set.
+                # test batch
+                for test_batch in data_loader.batched(batch_size, dataset="test", repeat=False):
+                    eval_step(model, test_metrics, test_batch)
+                for metric, value in test_metrics.compute().items():
+                    metrics_history[f'test_{metric}'].append(float(value))
+                test_metrics.reset()
+
+                logger.info(f"Epoch {epoch:>{int(np.log10((iterations-1)/steps_per_epoch+1)+6)}.5f} / step {step:>{int(np.log10(iterations)+1)}}: Train loss: {metrics_history['train_loss'][-1]:.5f}, Test loss: {metrics_history['test_loss'][-1]:.5f}")
+                # save metrics
+                with open(checkpoint_path / "metrics.csv", "a") as f:
+                    f.write(f"{step},{epoch:.5f}")
+                    for metric in metrics_history.keys():
+                        f.write(f",{metrics_history[metric][-1]}")
+                    f.write("\n")
+                
+                mlflow.log_metric("epoch", epoch, step=step)
                 for metric in metrics_history.keys():
-                    f.write(f",{metrics_history[metric][-1]}")
-                f.write("\n")
-        if (step != 0) and step % checkpoint_freq == 0:
-            logger.info(f"Checkpointing at step {step}")
-            _, state = nnx.split(model)
-            checkpointer.save(str(checkpoint_path/f"state_{step}"), state)
-            logger.info(f"Checkpoint saved to {checkpoint_path}")
-        if step >= iterations-1:
-            break
-    logger.info("Training complete")
-    # run the validation set for hyperparameter tuning
-    test_metrics.reset()
-    data_loader.clear_in_memory() # we're going to load the validation set into memory, we don't need the training set anymore, so let's free up the memory
-    for test_batch in data_loader.batched(batch_size, dataset="validation", repeat=False):
-        eval_step(model, test_metrics, test_batch)
-    for metric, value in test_metrics.compute().items():
-        logger.info(f"Validation {metric}: {value:.5f}")
-    
-    # Save model
-    state = nnx.state(model)
+                    mlflow.log_metric(metric, metrics_history[metric][-1], step=step)
+                
+                current_lr = schedule(step)
+                mlflow.log_metric("learning_rate", float(current_lr), step=step)
 
-    checkpointer.save(str(checkpoint_path/"state"), state)
-    logger.info(f"Model saved to {checkpoint_path}")
-    
-    checkpointer.wait_until_finished()
+            if (step != 0) and step % checkpoint_freq == 0:
+                logger.info(f"Checkpointing at step {step}")
+                _, state = nnx.split(model)
+                checkpointer.save(str(checkpoint_path/f"state_{step}"), state)
+                logger.info(f"Checkpoint saved to {checkpoint_path}")
+            if step >= iterations-1:
+                break
+        logger.info("Training complete")
+        # run the validation set for hyperparameter tuning
+        test_metrics.reset()
+        data_loader.clear_in_memory() # we're going to load the validation set into memory, we don't need the training set anymore, so let's free up the memory
+        for test_batch in data_loader.batched(batch_size, dataset="validation", repeat=False):
+            eval_step(model, test_metrics, test_batch)
+        for metric, value in test_metrics.compute().items():
+            logger.info(f"Validation {metric}: {value:.5f}")
+            mlflow.log_metric(f"validation_{metric}", float(value), step=step)
+        
+        # Save model
+        state = nnx.state(model)
+
+        checkpointer.save(str(checkpoint_path/"state"), state)
+        logger.info(f"Model saved to {checkpoint_path}")
+        
+        checkpointer.wait_until_finished()
+        # upload the final model to mlflow
+        mlflow.log_artifact(str(checkpoint_path/"state"), artifact_path="model")
+        # upload the metrics file to mlflow
+        mlflow.log_artifact(str(checkpoint_path/"metrics.csv"), artifact_path="metrics")
+        # upload the log file to mlflow
+        mlflow.log_artifact(str(checkpoint_path/"training.log"), artifact_path="logs")
     logging.shutdown()
 
 if __name__ == "__main__":

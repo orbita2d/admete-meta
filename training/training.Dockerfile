@@ -5,8 +5,10 @@ WORKDIR /app
 COPY training.py training.py
 
 ENV PYTHONUNBUFFERED=1
-ENV STEPS=40000
-ENV REGULARIZATION=0
-ENV DATA_DIR=/chess/training/data
+ENV REGULARIZATION_LOG=0
+ENV TRAIN_FILE=/chess/training/data/
+ENV CHECKPOINT_PATH=/chess/training/checkpoints
+ENV MLFLOW_TRACKING_URI=http://mlflow.junebug.lan:80
 
-CMD uv run training.py ${DATA_DIR} /chess/training/checkpoints ${STEPS} --regularization ${REGULARIZATION}
+# Set ITERATIONS at runtime
+CMD uv run training.py
