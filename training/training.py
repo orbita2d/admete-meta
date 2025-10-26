@@ -133,11 +133,16 @@ def regularize(model: AdmeteModel, regularization: float = 0., zero_delta: bool 
     # l2 norm over the accumulator deltas
     if zero_delta:
         return 0.
-    l_baseline = nnx.state(model)['accumulator_baseline'].kernel.value
+    bn_var = nnx.state(model)['accumulator_batchnorm'].var.value
     l_delta = nnx.state(model)['accumulator_delta'].kernel.value
-    norm_baseline = jnp.mean(jnp.square(l_baseline), axis=None)
-    norm_delta = jnp.mean(jnp.square(l_delta), axis=None)
-    return regularization * (norm_delta / norm_baseline)
+    # we know that after the batchnorm (before the bias and scale, the activations are ~ standard normal)
+    # so we can use the mean square contribution to the activations
+    # y = W x / sigma
+    # bn_var is (accumulator_neurons, )
+    r2 = jnp.mean(jnp.square(l_delta), axis=(0,1,2))
+    assert r2.shape == (HYPERPARAM_ACCUMULATOR_SIZE,)
+    norm_delta = jnp.mean(r2/bn_var)
+    return regularization * norm_delta
 
 base_params = nnx.All(nnx.Param, nnx.Not(nnx.PathContains("accumulator_delta")))
 delta_params = nnx.All(nnx.Param, nnx.PathContains("accumulator_delta"))
