@@ -10,7 +10,9 @@
 #    "scipy",
 #    "pyarrow",
 #    "tqdm",
-#   "mlflow",
+#    "mlflow",
+#    "psutil",
+#    "pynvml",
 #   ]
 # ///
 
