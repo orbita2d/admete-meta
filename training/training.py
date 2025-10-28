@@ -90,7 +90,7 @@ class AdmeteModel(nnx.Module):
     )
         self.layers = [self.hidden_layer, self.final_layer] # makes it easier to reason about the model when analysing the parameters
 
-    def __call__(self, us, them, k_us, k_them, train=False, zero_delta=False):
+    def __call__(self, us, them, k_us, k_them, train=False):
         assert us.shape[1] == N_FEATURES
         assert us.shape == them.shape
 
@@ -101,11 +101,8 @@ class AdmeteModel(nnx.Module):
                 lk = self.accumulator_delta.kernel[:, k_us, 0].T @ us
                 rk = self.accumulator_delta.kernel[:, k_them, 1].T @ them
                 return lk + rk
-            if not zero_delta:
-                x2 = nnx.vmap(delta_part, in_axes=(0, 0, 0, 0), out_axes=0)(us, them, k_us, k_them)
-                x = x1 + x2
-            else:
-                x = x1
+            x2 = nnx.vmap(delta_part, in_axes=(0, 0, 0, 0), out_axes=0)(us, them, k_us, k_them)
+            x = x1 + x2
         else:
             x = x1
 
@@ -131,40 +128,28 @@ def loss_fn(pred, labels):
     pred = jnp.clip(pred, eps, 1-eps) # avoid log(0)
     return -jnp.mean(labels*jnp.log(pred) + (1-labels)*jnp.log(1-pred)) 
 
-def regularize(model: AdmeteModel, regularization: float = 0., zero_delta: bool = False) -> jax.Array:
+def regularize(model: AdmeteModel, regularization: float = 0.) -> jax.Array:
     # l2 norm over the accumulator deltas
-    if zero_delta:
-        return 0.
-    bn_var = nnx.state(model)['accumulator_batchnorm'].var.value
+    l_baseline = nnx.state(model)['accumulator_baseline'].kernel.value
     l_delta = nnx.state(model)['accumulator_delta'].kernel.value
-    # we know that after the batchnorm (before the bias and scale, the activations are ~ standard normal)
-    # so we can use the mean square contribution to the activations
-    # y = W x / sigma
-    # bn_var is (accumulator_neurons, )
-    r2 = jnp.mean(jnp.square(l_delta), axis=(0,1,2))
-    assert r2.shape == (HYPERPARAM_ACCUMULATOR_SIZE,)
-    norm_delta = jnp.mean(r2/bn_var)
-    return regularization * norm_delta
+    norm_baseline = jnp.mean(jnp.square(l_baseline), axis=None)
+    norm_delta = jnp.mean(jnp.square(l_delta), axis=None)
+    return regularization * (norm_delta / norm_baseline)
 
 base_params = nnx.All(nnx.Param, nnx.Not(nnx.PathContains("accumulator_delta")))
 delta_params = nnx.All(nnx.Param, nnx.PathContains("accumulator_delta"))
 
 # @nnx.jit
 @partial(nnx.jit, static_argnames=('freeze_delta'))
-def train_step(model:nnx.Module, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, batch: dict[str, jax.Array], regularization: float, freeze_delta: bool = False):
+def train_step(model:nnx.Module, optimizer: nnx.Optimizer, metrics: nnx.MultiMetric, batch: dict[str, jax.Array], regularization: float):
     def loss(model: AdmeteModel, regularization: float):
-        pred = model(batch['f_us'], batch['f_them'], batch['k_us'], batch['k_them'], train=True, zero_delta=freeze_delta)
+        pred = model(batch['f_us'], batch['f_them'], batch['k_us'], batch['k_them'], train=True)
         if ENABLE_NNUE:
-            return loss_fn(nnx.sigmoid(pred), batch['label']) + regularize(model, regularization, zero_delta=freeze_delta)
+            return loss_fn(nnx.sigmoid(pred), batch['label']) + regularize(model, regularization)
         else:
             return loss_fn(nnx.sigmoid(pred), batch['label'])
     
-    if freeze_delta:
-        diff_state = nnx.DiffState(0, base_params) # only update the base parameters, not the delta parameters (much faster)
-    else:
-        diff_state = 0
-    
-    grads = nnx.grad(loss, argnums=diff_state)(model, regularization)
+    grads = nnx.grad(loss, argnums=0)(model, regularization)
     loss_ex_reg = loss(model, 0.)
     optimizer.update(grads)
     metrics.update(loss=loss_ex_reg)
